@@ -3,283 +3,290 @@
 #define _FIREWIRE_CORE_H
 
 #include <linux/compiler.h>
-#include <linux/devicense-Identifier: GPL-2.0 */
-#inux/bug.h>
-#include <linux/completion.h>
 #include <linux/device.h>
-#include <linux/errno.h>
-#include <linux/firewire.h>
-#include <linux/firewire-constants.h>
+#include <linux/dma-mapping.h>
 #include <linux/fs.h>
-#include <linux/init.h>
-#include <linux/jiffies.h>
-#include <linux/kernel.h>
 #include <linux/list.h>
-#include <linux/module.h>
-#include <linux/rculist.h>
+#include <linux/xarray.h>
+#include <linux/mm_types.h>
+#include <linux/rwsem.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/string.h>
-#include <linux/timer.h>
 #include <linux/types.h>
-#include <linux/workqueue.h>
 
-#include <asm/byteorder.h>
+#include <linux/refcount.h>
 
-#include "core.h"
-#include "packet-header-definitions.h"
-#include "phy-packet-definitions.h"
-#include <trace/events/firewire.h>
+struct device;
+struct fw_card;
+struct fw_device;
+struct fw_iso_buffer;
+struct fw_iso_context;
+struct fw_iso_packet;
+struct fw_node;
+struct fw_packet;
 
-#define HEADER_DESTINATION_IS_BROADCAST(header) \
-	((async_header_get_destination(header) & 0x3f) == 0x3f)
 
-/* returns 0 if the split timeout handler is already running */
-static int try_cancel_split_timeout(struct fw_transaction *t)
+/* -card */
+
+extern __printf(2, 3)
+void fw_err(const struct fw_card *card, const char *fmt, ...);
+extern __printf(2, 3)
+void fw_notice(const struct fw_card *card, const char *fmt, ...);
+
+/* bitfields within the PHY registers */
+#define PHY_LINK_ACTIVE		0x80
+#define PHY_CONTENDER		0x40
+#define PHY_BUS_RESET		0x40
+#define PHY_EXTENDED_REGISTERS	0xe0
+#define PHY_BUS_SHORT_RESET	0x40
+#define PHY_INT_STATUS_BITS	0x3c
+#define PHY_ENABLE_ACCEL	0x02
+#define PHY_ENABLE_MULTI	0x01
+#define PHY_PAGE_SELECT		0xe0
+
+#define BANDWIDTH_AVAILABLE_INITIAL	4915
+#define BROADCAST_CHANNEL_INITIAL	(1 << 31 | 31)
+#define BROADCAST_CHANNEL_VALID		(1 << 30)
+
+#define CSR_STATE_BIT_CMSTR	(1 << 8)
+#define CSR_STATE_BIT_ABDICATE	(1 << 10)
+
+struct fw_card_driver {
+	/*
+	 * Enable the given card with the given initial config rom.
+	 * This function is expected to activate the card, and either
+	 * enable the PHY or set the link_on bit and initiate a bus
+	 * reset.
+	 */
+	int (*enable)(struct fw_card *card,
+		      const __be32 *config_rom, size_t length);
+
+	int (*read_phy_reg)(struct fw_card *card, int address);
+	int (*update_phy_reg)(struct fw_card *card, int address,
+			      int clear_bits, int set_bits);
+
+	/*
+	 * Update the config rom for an enabled card.  This function
+	 * should change the config rom that is presented on the bus
+	 * and initiate a bus reset.
+	 */
+	int (*set_config_rom)(struct fw_card *card,
+			      const __be32 *config_rom, size_t length);
+
+	void (*send_request)(struct fw_card *card, struct fw_packet *packet);
+	void (*send_response)(struct fw_card *card, struct fw_packet *packet);
+	/* Calling cancel is valid once a packet has been submitted. */
+	int (*cancel_packet)(struct fw_card *card, struct fw_packet *packet);
+
+	/*
+	 * Allow the specified node ID to do direct DMA out and in of
+	 * host memory.  The card will disable this for all node when
+	 * a bus reset happens, so driver need to reenable this after
+	 * bus reset.  Returns 0 on success, -ENODEV if the card
+	 * doesn't support this, -ESTALE if the generation doesn't
+	 * match.
+	 */
+	int (*enable_phys_dma)(struct fw_card *card,
+			       int node_id, int generation);
+
+	u32 (*read_csr)(struct fw_card *card, int csr_offset);
+	void (*write_csr)(struct fw_card *card, int csr_offset, u32 value);
+
+	struct fw_iso_context *
+	(*allocate_iso_context)(struct fw_card *card,
+				int type, int channel, size_t header_size);
+	void (*free_iso_context)(struct fw_iso_context *ctx);
+
+	int (*start_iso)(struct fw_iso_context *ctx,
+			 s32 cycle, u32 sync, u32 tags);
+
+	int (*set_iso_channels)(struct fw_iso_context *ctx, u64 *channels);
+
+	int (*queue_iso)(struct fw_iso_context *ctx,
+			 struct fw_iso_packet *packet,
+			 struct fw_iso_buffer *buffer,
+			 unsigned long payload);
+
+	void (*flush_queue_iso)(struct fw_iso_context *ctx);
+
+	int (*flush_iso_completions)(struct fw_iso_context *ctx);
+
+	int (*stop_iso)(struct fw_iso_context *ctx);
+};
+
+void fw_card_initialize(struct fw_card *card,
+		const struct fw_card_driver *driver, struct device *device);
+int fw_card_add(struct fw_card *card, u32 max_receive, u32 link_speed, u64 guid,
+		unsigned int supported_isoc_contexts);
+void fw_core_remove_card(struct fw_card *card);
+int fw_compute_block_crc(__be32 *block);
+void fw_schedule_bm_work(struct fw_card *card, unsigned long delay);
+
+/* -cdev */
+
+extern const struct file_operations fw_device_ops;
+
+void fw_device_cdev_update(struct fw_device *device);
+void fw_device_cdev_remove(struct fw_device *device);
+void fw_cdev_handle_phy_packet(struct fw_card *card, struct fw_packet *p);
+
+
+/* -device */
+
+extern struct rw_semaphore fw_device_rwsem;
+extern struct xarray fw_device_xa;
+extern int fw_cdev_major;
+
+static inline struct fw_device *fw_device_get(struct fw_device *device)
 {
-	if (t->is_split_transaction)
-		return del_timer(&t->split_timeout_timer);
-	else
-		return 1;
+	get_device(&device->device);
+
+	return device;
 }
 
-static int close_transaction(struct fw_transaction *transaction, struct fw_card *card, int rcode,
-			     u32 response_tstamp)
+static inline void fw_device_put(struct fw_device *device)
 {
-	struct fw_transaction *t = NULL, *iter;
-
-	scoped_guard(spinlock_irqsave, &card->lock) {
-		list_for_each_entry(iter, &card->transaction_list, link) {
-			if (iter == transaction) {
-				if (try_cancel_split_timeout(iter)) {
-					list_del_init(&iter->link);
-					card->tlabel_mask &= ~(1ULL << iter->tlabel);
-					t = iter;
-				}
-				break;
-			}
-		}
-	}
-
-	if (!t)
-		return -ENOENT;
-
-	if (!t->with_tstamp) {
-		t->callback.without_tstamp(card, rcode, NULL, 0, t->callback_data);
-	} else {
-		t->callback.with_tstamp(card, rcode, t->packet.timestamp, response_tstamp, NULL, 0,
-					t->callback_data);
-	}
-
-	return 0;
+	put_device(&device->device);
 }
+
+struct fw_device *fw_device_get_by_devt(dev_t devt);
+int fw_device_set_broadcast_channel(struct device *dev, void *gen);
+void fw_node_event(struct fw_card *card, struct fw_node *node, int event);
+
+
+/* -iso */
+
+int fw_iso_buffer_alloc(struct fw_iso_buffer *buffer, int page_count);
+int fw_iso_buffer_map_dma(struct fw_iso_buffer *buffer, struct fw_card *card,
+			  enum dma_data_direction direction);
+
+static inline void fw_iso_context_init_work(struct fw_iso_context *ctx, work_func_t func)
+{
+	INIT_WORK(&ctx->work, func);
+}
+
+
+/* -topology */
+
+enum {
+	FW_NODE_CREATED,
+	FW_NODE_UPDATED,
+	FW_NODE_DESTROYED,
+	FW_NODE_LINK_ON,
+	FW_NODE_LINK_OFF,
+	FW_NODE_INITIATED_RESET,
+};
+
+struct fw_node {
+	u16 node_id;
+	u8 color;
+	u8 port_count;
+	u8 link_on:1;
+	u8 initiated_reset:1;
+	u8 b_path:1;
+	u8 phy_speed:2;	/* As in the self ID packet. */
+	u8 max_speed:2;	/* Minimum of all phy-speeds on the path from the
+			 * local node to this node. */
+	u8 max_depth:4;	/* Maximum depth to any leaf node */
+	u8 max_hops:4;	/* Max hops in this sub tree */
+
+	struct kref kref;
+
+	/* For serializing node topology into a list. */
+	struct list_head link;
+
+	/* Upper layer specific data. */
+	void *data;
+
+	struct fw_node *ports[] __counted_by(port_count);
+};
+
+static inline struct fw_node *fw_node_get(struct fw_node *node)
+{
+	kref_get(&node->kref);
+
+	return node;
+}
+
+static void release_node(struct kref *kref)
+{
+	struct fw_node *node = container_of(kref, struct fw_node, kref);
+
+	kfree(node);
+}
+
+static inline void fw_node_put(struct fw_node *node)
+{
+	kref_put(&node->kref, release_node);
+}
+
+void fw_core_handle_bus_reset(struct fw_card *card, int node_id,
+	int generation, int self_id_count, u32 *self_ids, bool bm_abdicate);
+void fw_destroy_nodes(struct fw_card *card);
 
 /*
- * Only valid for transactions that are potentially pending (ie have
- * been sent).
+ * Check whether new_generation is the immediate successor of old_generation.
+ * Take counter roll-over at 255 (as per OHCI) into account.
  */
-int fw_cancel_transaction(struct fw_card *card,
-			  struct fw_transaction *transaction)
+static inline bool is_next_generation(int new_generation, int old_generation)
 {
-	u32 tstamp;
-
-	/*
-	 * Cancel the packet transmission if it's still queued.  That
-	 * will call the packet transmission callback which cancels
-	 * the transaction.
-	 */
-
-	if (card->driver->cancel_packet(card, &transaction->packet) == 0)
-		return 0;
-
-	/*
-	 * If the request packet has already been sent, we need to see
-	 * if the transaction is still pending and remove it in that case.
-	 */
-
-	if (transaction->packet.ack == 0) {
-		// The timestamp is reused since it was just read now.
-		tstamp = transaction->packet.timestamp;
-	} else {
-		u32 curr_cycle_time = 0;
-
-		(void)fw_card_read_cycle_time(card, &curr_cycle_time);
-		tstamp = cycle_time_to_ohci_tstamp(curr_cycle_time);
-	}
-
-	return close_transaction(transaction, card, RCODE_CANCELLED, tstamp);
-}
-EXPORT_SYMBOL(fw_cancel_transaction);
-
-static void split_transaction_timeout_callback(struct timer_list *timer)
-{
-	struct fw_transaction *t = from_timer(t, timer, split_timeout_timer);
-	struct fw_card *card = t->card;
-
-	scoped_guard(spinlock_irqsave, &card->lock) {
-		if (list_empty(&t->link))
-			return;
-		list_del(&t->link);
-		card->tlabel_mask &= ~(1ULL << t->tlabel);
-	}
-
-	if (!t->with_tstamp) {
-		t->callback.without_tstamp(card, RCODE_CANCELLED, NULL, 0, t->callback_data);
-	} else {
-		t->callback.with_tstamp(card, RCODE_CANCELLED, t->packet.timestamp,
-					t->split_timeout_cycle, NULL, 0, t->callback_data);
-	}
+	return (new_generation & 0xff) == ((old_generation + 1) & 0xff);
 }
 
-static void start_split_transaction_timeout(struct fw_transaction *t,
-					    struct fw_card *card)
+
+/* -transaction */
+
+#define TCODE_LINK_INTERNAL		0xe
+
+static inline bool tcode_is_read_request(unsigned int tcode)
 {
-	guard(spinlock_irqsave)(&card->lock);
-
-	if (list_empty(&t->link) || WARN_ON(t->is_split_transaction))
-		return;
-
-	t->is_split_transaction = true;
-	mod_timer(&t->split_timeout_timer,
-		  jiffies + card->split_timeout_jiffies);
+	return (tcode & ~1u) == 4u;
 }
 
-static u32 compute_split_timeout_timestamp(struct fw_card *card, u32 request_timestamp);
-
-static void transmit_complete_callback(struct fw_packet *packet,
-				       struct fw_card *card, int status)
+static inline bool tcode_is_block_packet(unsigned int tcode)
 {
-	struct fw_transaction *t =
-	    container_of(packet, struct fw_transaction, packet);
-
-	trace_async_request_outbound_complete((uintptr_t)t, card->index, packet->generation,
-					      packet->speed, status, packet->timestamp);
-
-	switch (status) {
-	case ACK_COMPLETE:
-		close_transaction(t, card, RCODE_COMPLETE, packet->timestamp);
-		break;
-	case ACK_PENDING:
-	{
-		t->split_timeout_cycle =
-			compute_split_timeout_timestamp(card, packet->timestamp) & 0xffff;
-		start_split_transaction_timeout(t, card);
-		break;
-	}
-	case ACK_BUSY_X:
-	case ACK_BUSY_A:
-	case ACK_BUSY_B:
-		close_transaction(t, card, RCODE_BUSY, packet->timestamp);
-		break;
-	case ACK_DATA_ERROR:
-		close_transaction(t, card, RCODE_DATA_ERROR, packet->timestamp);
-		break;
-	case ACK_TYPE_ERROR:
-		close_transaction(t, card, RCODE_TYPE_ERROR, packet->timestamp);
-		break;
-	default:
-		/*
-		 * In this case the ack is really a juju specific
-		 * rcode, so just forward that to the callback.
-		 */
-		close_transaction(t, card, status, packet->timestamp);
-		break;
-	}
+	return (tcode & 1u) != 0u;
 }
 
-static void fw_fill_request(struct fw_packet *packet, int tcode, int tlabel,
-		int destination_id, int source_id, int generation, int speed,
-		unsigned long long offset, void *payload, size_t length)
+static inline bool tcode_is_link_internal(unsigned int tcode)
 {
-	int ext_tcode;
-
-	if (tcode == TCODE_STREAM_DATA) {
-		// The value of destination_id argument should include tag, channel, and sy fields
-		// as isochronous packet header has.
-		packet->header[0] = destination_id;
-		isoc_header_set_data_length(packet->header, length);
-		isoc_header_set_tcode(packet->header, TCODE_STREAM_DATA);
-		packet->header_length = 4;
-		packet->payload = payload;
-		packet->payload_length = length;
-
-		goto common;
-	}
-
-	if (tcode > 0x10) {
-		ext_tcode = tcode & ~0x10;
-		tcode = TCODE_LOCK_REQUEST;
-	} else
-		ext_tcode = 0;
-
-	async_header_set_retry(packet->header, RETRY_X);
-	async_header_set_tlabel(packet->header, tlabel);
-	async_header_set_tcode(packet->header, tcode);
-	async_header_set_destination(packet->header, destination_id);
-	async_header_set_source(packet->header, source_id);
-	async_header_set_offset(packet->header, offset);
-
-	switch (tcode) {
-	case TCODE_WRITE_QUADLET_REQUEST:
-		async_header_set_quadlet_data(packet->header, *(u32 *)payload);
-		packet->header_length = 16;
-		packet->payload_length = 0;
-		break;
-
-	case TCODE_LOCK_REQUEST:
-	case TCODE_WRITE_BLOCK_REQUEST:
-		async_header_set_data_length(packet->header, length);
-		async_header_set_extended_tcode(packet->header, ext_tcode);
-		packet->header_length = 16;
-		packet->payload = payload;
-		packet->payload_length = length;
-		break;
-
-	case TCODE_READ_QUADLET_REQUEST:
-		packet->header_length = 12;
-		packet->payload_length = 0;
-		break;
-
-	case TCODE_READ_BLOCK_REQUEST:
-		async_header_set_data_length(packet->header, length);
-		async_header_set_extended_tcode(packet->header, ext_tcode);
-		packet->header_length = 16;
-		packet->payload_length = 0;
-		break;
-
-	default:
-		WARN(1, "wrong tcode %d\n", tcode);
-	}
- common:
-	packet->speed = speed;
-	packet->generation = generation;
-	packet->ack = 0;
-	packet->payload_mapped = false;
+	return (tcode == TCODE_LINK_INTERNAL);
 }
 
-static int allocate_tlabel(struct fw_card *card)
+#define LOCAL_BUS 0xffc0
+
+/* OHCI-1394's default upper bound for physical DMA: 4 GB */
+#define FW_MAX_PHYSICAL_RANGE		(1ULL << 32)
+
+void fw_core_handle_request(struct fw_card *card, struct fw_packet *request);
+void fw_core_handle_response(struct fw_card *card, struct fw_packet *packet);
+int fw_get_response_length(struct fw_request *request);
+void fw_fill_response(struct fw_packet *response, u32 *request_header,
+		      int rcode, void *payload, size_t length);
+
+void fw_request_get(struct fw_request *request);
+void fw_request_put(struct fw_request *request);
+
+// Convert the value of IEEE 1394 CYCLE_TIME register to the format of timeStamp field in
+// descriptors of 1394 OHCI.
+static inline u32 cycle_time_to_ohci_tstamp(u32 tstamp)
 {
-	int tlabel;
-
-	tlabel = card->current_tlabel;
-	while (card->tlabel_mask & (1ULL << tlabel)) {
-		tlabel = (tlabel + 1) & 0x3f;
-		if (tlabel == card->current_tlabel)
-			return -EBUSY;
-	}
-
-	card->current_tlabel = (tlabel + 1) & 0x3f;
-	card->tlabel_mask |= 1ULL << tlabel;
-
-	return tlabel;
+	return (tstamp & 0x0ffff000) >> 12;
 }
 
-/**
- * __fw_send_request() - submit a request packet for transmission to generate callback for response
- *			 subaction with or without time stamp.
- * @card:		interface to send the request at
- * @t:			transaction instance to which the request belongs
- * @tcode:		transaction code
- * @destination_id:	destination node ID, consisting of bus_ID and phy_ID
- * @generation:		bus generation in which request and response are valid
- * @speed:		transmiss
+#define FW_PHY_CONFIG_NO_NODE_ID	-1
+#define FW_PHY_CONFIG_CURRENT_GAP_COUNT	-1
+void fw_send_phy_config(struct fw_card *card,
+			int node_id, int generation, int gap_count);
+
+static inline bool is_ping_packet(u32 *data)
+{
+	return (data[0] & 0xc0ffffff) == 0 && ~data[0] == data[1];
+}
+
+static inline bool is_in_fcp_region(u64 offset, size_t length)
+{
+	return offset >= (CSR_REGISTER_BASE | CSR_FCP_COMMAND) &&
+		offset + length <= (CSR_REGISTER_BASE | CSR_FCP_END);
+}
+
+#endif /* _FIREWIRE_CORE_H */
