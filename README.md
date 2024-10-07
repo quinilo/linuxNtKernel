@@ -1,20 +1,26 @@
-Linux kernel
+LinuxNtKernel
 ============
 
 There are several guides for kernel developers and users. These guides can
 be rendered in a number of formats, like HTML and PDF. Please read
 Documentation/admin-guide/README.rst first.
 
-In order to build the documentation, use ``make htmldocs`` or
-``make pdfdocs``.  The formatted documentation can also be read online at:
+# FAQ
 
-    https://www.kernel.org/doc/html/latest/
+Does it work on all platforms?
 
-There are various text files in the Documentation/ subdirectory,
-several of them using the reStructuredText markup notation.
+    Define "work."
 
-Please read the Documentation/process/changes.rst file, as it contains the
-requirements for building and running the kernel, and information about
-the problems which may result by upgrading your kernel.
+Is this compatible with NTFS?
+
+    Oh, absolutely! LinuxNtKernel loves NTFS... so much that it refuses to mount it out of pure emotional attachment. (We’re working on it.)
+
+Will it improve my system's performance?
+
+    That depends. Do you consider frequent kernel panics to be a form of "improvement"?
+
+Can I use this in production?
+
+    Technically, yes. But only if you hate your users.
 
 ![image](https://raw.githubusercontent.com/quinilo/linuxNtKernel/refs/heads/master/linuxnt-example.jpg)
