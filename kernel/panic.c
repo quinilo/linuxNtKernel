@@ -724,6 +724,8 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
 
 	disable_trace_on_warning();
 
+	pr_warn("Deine mudda");
+
 	if (file)
 		pr_warn("WARNING: CPU: %d PID: %d at %s:%d %pS\n",
 			raw_smp_processor_id(), current->pid, file, line,
